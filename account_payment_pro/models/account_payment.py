@@ -527,11 +527,11 @@ class AccountPayment(models.Model):
     @api.onchange("to_pay_amount")
     def _inverse_to_pay_amount(self):
         for rec in self:
-            # Si no hay moneda definida todavía, no hace
-            if not rec.currency_id:
-                continue
-
-            if not rec.currency_id.is_zero(rec.unreconciled_amount - (rec.to_pay_amount - rec.selected_debt)):
+            # agregamos este chequeo porque cuando estamos creando un pago nuevo se llama este inverse siempre
+            # y si el monto no cambio no queremos que trigeree re computo de retenciones
+            # (por el depends de _compute_base_amount)
+            # CÓDIGO CORREGIDO
+            if rec.currency_id and not rec.currency_id.is_zero(rec.unreconciled_amount - (rec.to_pay_amount - rec.selected_debt)):
                 rec.unreconciled_amount = rec.to_pay_amount - rec.selected_debt
 
     # We dont set 'is_internal_transfer' as a dependencies as it could leed to recompute to_pay_move_line_ids
