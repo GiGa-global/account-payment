@@ -544,15 +544,10 @@ class AccountPayment(models.Model):
             # agregamos este chequeo porque cuando estamos creando un pago nuevo se llama este inverse siempre
             # y si el monto no cambio no queremos que trigeree re computo de retenciones
             # (por el depends de _compute_base_amount)
-<<<<<<< HEAD
-            if rec.currency_id and not rec.currency_id.is_zero(
-                rec.unreconciled_amount - (rec.to_pay_amount - rec.selected_debt)
-            ):
-=======
             # CÓDIGO CORREGIDO
             if rec.currency_id and not rec.currency_id.is_zero(rec.unreconciled_amount - (rec.to_pay_amount - rec.selected_debt)):
->>>>>>> origin/Test_251001
                 rec.unreconciled_amount = rec.to_pay_amount - rec.selected_debt
+
 
     # We dont set 'is_internal_transfer' as a dependencies as it could leed to recompute to_pay_move_line_ids
     @api.depends("partner_id", "partner_type", "company_id")
