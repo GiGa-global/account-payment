@@ -527,7 +527,7 @@ class AccountPayment(models.Model):
     @api.onchange("to_pay_amount")
     def _inverse_to_pay_amount(self):
         for rec in self:
-            # Si no hay moneda definida todavía, no hace nada
+            # Si no hay moneda definida todavía, no hace
             if not rec.currency_id:
                 continue
 
