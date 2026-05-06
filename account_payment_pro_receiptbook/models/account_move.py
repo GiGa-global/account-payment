@@ -17,7 +17,7 @@ class AccountMove(models.Model):
         TODO: tal vez lo mejor sea cambiar para no guardar mas numero de recibo en el asiento, pero eso es un cambio
         gigante
         """
-        if self.journal_id.type in ("cash", "bank") and not self.receiptbook_id:
+        if self.journal_id.type in ("cash", "bank", "credit") and not self.receiptbook_id:
             # mandamos en contexto que estamos en esta condicion para poder meternos en el search que ejecuta super
             # y que el pago de referencia que se usa para adivinar el tipo de secuencia sea un pago sin tipo de
             # documento
@@ -36,7 +36,7 @@ class AccountMove(models.Model):
         return super()._search(domain, *args, **kwargs)
 
     def _compute_made_sequence_hole(self):
-        receiptbook_recs = self.filtered(lambda x: x.receiptbook_id and x.journal_id.type in ("bank", "cash"))
+        receiptbook_recs = self.filtered(lambda x: x.receiptbook_id and x.journal_id.type in ("bank", "cash", "credit"))
         receiptbook_recs.made_sequence_hole = False
         super(AccountMove, self - receiptbook_recs)._compute_made_sequence_hole()
 
@@ -45,7 +45,9 @@ class AccountMove(models.Model):
         super()._compute_name()
         for move in self.filtered(
             lambda x: x.origin_payment_id.receiptbook_id
-            and (x.state == "draft" or x.origin_payment_id.state == "draft")
+            and (
+                x.state == "draft" or x.origin_payment_id.state == "draft" or x.origin_payment_id.payment_transaction_id
+            )
         ):
             move.name = move.origin_payment_id.name
 
@@ -72,8 +74,16 @@ class AccountMove(models.Model):
                     [
                         ("receiptbook_id", "=", receiptbook.id),
                         ("sequence_prefix", "=", prefix),
-                        ("sequence_number", ">=", min(moves.mapped("sequence_number")) - 1),
-                        ("sequence_number", "<=", max(moves.mapped("sequence_number")) - 1),
+                        (
+                            "sequence_number",
+                            ">=",
+                            min(moves.mapped("sequence_number")) - 1,
+                        ),
+                        (
+                            "sequence_number",
+                            "<=",
+                            max(moves.mapped("sequence_number")) - 1,
+                        ),
                     ]
                 )
                 .mapped("sequence_number")
@@ -82,3 +92,10 @@ class AccountMove(models.Model):
                 move.made_sequence_gap = move.sequence_number > 1 and (move.sequence_number - 1) not in previous_numbers
 
         super(AccountMove, self - with_receiptbook)._compute_made_sequence_gap()
+
+    def _must_check_constrains_date_sequence(self):
+        # OVERRIDES sequence.mixin to skip date sequence check for receiptbook moves
+        self.ensure_one()
+        if self.receiptbook_id:
+            return False
+        return super()._must_check_constrains_date_sequence()

@@ -35,14 +35,21 @@ class PopSessionJournalControl(models.Model):
     @api.depends("cashbox_session_id.payment_ids", "cashbox_session_id.payment_ids.state", "balance_start")
     def _compute_amounts(self):
         payments_lines = self.env["account.payment"].search(
-            [("cashbox_session_id", "in", self.mapped("cashbox_session_id").ids), ("state", "!=", "draft")]
+            [
+                ("cashbox_session_id", "in", self.mapped("cashbox_session_id").ids),
+                ("state", "not in", ["draft", "canceled"]),
+            ]
         )
         for record in self:
-            amount = sum(
-                payments_lines.filtered(
-                    lambda p: p.cashbox_session_id == record.cashbox_session_id and p.journal_id == record.journal_id
-                ).mapped("amount_signed")
+            lines = payments_lines.filtered(
+                lambda p: p.cashbox_session_id == record.cashbox_session_id and p.journal_id == record.journal_id
             )
+
+            if record.journal_id.currency_id:
+                amount = sum(lines.mapped("amount_signed"))
+            else:
+                amount = sum(lines.mapped("amount_company_currency_signed"))
+
             record.amount = amount
             record.balance_end = amount + record.balance_start
             self -= record

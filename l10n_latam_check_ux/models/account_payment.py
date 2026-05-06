@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from odoo import fields, models
+from odoo import api, fields, models
 from odoo.exceptions import ValidationError
 
 
@@ -11,6 +11,25 @@ class AccountPayment(models.Model):
         string="Operation Date",
         default=fields.Datetime.now(),
     )
+
+    @api.constrains("l10n_latam_move_check_ids_operation_date", "state")
+    def _check_last_operation_on_state_change(self):
+        """
+        Constraint to prevent changing the state of a check operation if it is not the last operation.
+        """
+        import_file = self.env.context.get("import_file")
+        if not import_file:
+            return
+        for rec in self:
+            # Only validate if the payment has checks associated and state is changing
+            checks = rec.l10n_latam_move_check_ids | rec.l10n_latam_new_check_ids
+            for check in checks:
+                last_operation = check._get_last_operation()
+                if last_operation and rec != last_operation:
+                    raise ValidationError(
+                        "You cannot change the state of this operation because it is not the last operation for check %s."
+                        % check.name
+                    )
 
     def action_post(self):
         # nosotros queremos bloquear tmb nros de cheques de terceros que sea unicos
@@ -38,7 +57,8 @@ class AccountPayment(models.Model):
         # Who already create both payments at once in the _create_payments method.)
         if not self.env.context.get("check_deposit_transfer"):
             third_party_checks = self.filtered(
-                lambda x: x.payment_method_line_id.code in ["in_third_party_checks", "out_third_party_checks"]
+                lambda x: x.payment_method_line_id.code
+                in ["in_third_party_checks", "out_third_party_checks", "return_third_party_checks"]
             )
             for rec in third_party_checks:
                 dest_payment_method_code = (
@@ -71,6 +91,15 @@ class AccountPayment(models.Model):
                 )
                 rec._get_latam_checks()._compute_current_journal()
                 rec._get_latam_checks()._compute_company_id()
+
+                # If the journal belongs to the third-party checks journal, posting the move was incorrectly removing the checks,
+                # even though the payment method line is for checks.
+                # To fix this, we replicate the same behavior as in Odoo's "transfer check" wizard by setting the proper payment method.
+                correct_dest_payment_method = rec.destination_journal_id.inbound_payment_method_line_ids.filtered(
+                    lambda x: x.code == "in_third_party_checks"
+                )
+                if correct_dest_payment_method:
+                    rec.paired_internal_transfer_payment_id.payment_method_line_id = correct_dest_payment_method
             super(AccountPayment, self - third_party_checks)._create_paired_internal_transfer_payment()
 
     def action_draft(self):

@@ -8,9 +8,8 @@ class L10nLatamPaymentMassTransfer(models.TransientModel):
     cashbox_session_id = fields.Many2one(
         "account.cashbox.session",
         string="POP Session",
-        compute="_compute_cashbox_session_id",
         readonly=False,
-        store=True,
+        compute="_compute_cashbox_session_id",
     )
     requiere_account_cashbox_session = fields.Boolean(
         compute="_compute_requiere_account_cashbox_session",
@@ -24,10 +23,13 @@ class L10nLatamPaymentMassTransfer(models.TransientModel):
     def _compute_requiere_account_cashbox_session(self):
         self.requiere_account_cashbox_session = self.env.user.requiere_account_cashbox_session
 
+    @api.depends("destination_journal_id")
     def _compute_cashbox_session_id(self):
         for rec in self:
-            session_ids = self.env["account.cashbox.session"].search(
-                [("state", "=", "opened"), "|", ("user_ids", "=", self.env.uid), ("user_ids", "=", False)]
+            session_ids = (
+                self.env["account.cashbox.session"]
+                .search([("state", "=", "opened"), "|", ("user_ids", "=", self.env.uid), ("user_ids", "=", False)])
+                .filtered(lambda x: rec.destination_journal_id in x.cashbox_id.journal_ids)
             )
             if len(session_ids) == 1:
                 rec.cashbox_session_id = session_ids.id
