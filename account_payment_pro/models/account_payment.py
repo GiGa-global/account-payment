@@ -149,6 +149,18 @@ class AccountPayment(models.Model):
     @api.model
     def default_get(self, fields_list):
         res = super().default_get(fields_list)
+        # Si se pasa company_id explícitamente por contexto, evitamos que journal_id
+        # proveniente de ir.default (valores predeterminados del usuario) y perteneciente
+        # a otra compañía dispare el precompute _compute_company_id y sobreescriba la
+        # compañía correcta del pago por la compañía principal del entorno.
+        default_company_id = self._context.get("default_company_id")
+        if default_company_id and "journal_id" in res:
+            journal = self.env["account.journal"].browse(res["journal_id"])
+            if journal.company_id.id != default_company_id:
+                res.pop("journal_id")
+        ir_defaults = self.env["ir.default"].with_company(default_company_id)._get_model_defaults(self._name)
+        if "journal_id" in ir_defaults:
+            res["journal_id"] = self.env["account.journal"].browse(ir_defaults["journal_id"]).id
         if "previous_currency_id" in fields_list and "previous_currency_id" not in res:
             currency_id = res.get("currency_id")
             if not currency_id:
@@ -306,6 +318,15 @@ class AccountPayment(models.Model):
             else:
                 rec.counterpart_exchange_rate = False
 
+    @api.constrains("counterpart_exchange_rate")
+    def _check_counterpart_exchange_rate(self):
+        for rec in self.filtered(
+            lambda x: x.counterpart_currency_id and (not x.counterpart_exchange_rate or x.counterpart_exchange_rate < 0)
+        ):
+            raise ValidationError(
+                _("Counterpart exchange rate must be positive and not zero when counterpart currency is set.")
+            )
+
     # this onchange is necesary because odoo, sometimes, re-compute
     # and overwrites amount_company_currency. That happends due to an issue
     # with rounding of amount field (amount field is not change but due to
@@ -328,7 +349,7 @@ class AccountPayment(models.Model):
 
     @api.onchange("amount")
     def _onchange_amount_update_exact(self):
-        for rec in self:
+        for rec in self.filtered("currency_id"):
             if not rec.currency_id.is_zero(rec.amount - rec.amount_exact):
                 rec.amount_exact = rec.amount
 
@@ -345,7 +366,7 @@ class AccountPayment(models.Model):
                 old_currency = rec.company_currency_id
             # Actualizar para el próximo onchange antes de cualquier continue
             rec.previous_currency_id = new_currency
-            if rec.state != "draft" or not rec.amount:
+            if rec.state != "draft":
                 continue
 
             old_amount = rec.amount_exact or rec.amount
@@ -363,17 +384,20 @@ class AccountPayment(models.Model):
             if (
                 rec.env.context.get("default_amount")
                 and rec.currency_id == rec.company_currency_id
-                and rec.amount_exact == rec._origin.amount_exact
+                and rec.currency_id.is_zero(rec._origin.amount_exact)
                 and not rec.currency_id.is_zero(amount - rec.env.context.get("default_amount"))
             ):
                 amount = rec.env.context.get("default_amount")
             rec.update({"amount_exact": amount, "amount": amount})
 
-    @api.depends("amount", "amount_exact", "other_currency", "force_amount_company_currency")
+    @api.depends(
+        "amount", "amount_exact", "other_currency", "force_amount_company_currency", "amount_company_currency_signed"
+    )
     def _compute_amount_company_currency(self):
         """
         * Si las monedas son iguales devuelve 1
         * si no, si hay force_amount_company_currency, devuelve ese valor
+        * si ya hay asiento, usa el importe contable nativo sin signo
         * sino, devuelve el amount convertido a la moneda de la cia
         """
         for rec in self:
@@ -382,9 +406,14 @@ class AccountPayment(models.Model):
                 amount_company_currency = amount
             elif rec.force_amount_company_currency:
                 amount_company_currency = rec.force_amount_company_currency
+            elif rec.move_id:
+                amount_company_currency = abs(rec.amount_company_currency_signed)
             else:
                 amount_company_currency = rec.currency_id._convert(
-                    amount, rec.company_id.currency_id, rec.company_id, rec.date
+                    amount,
+                    rec.company_id.currency_id,
+                    rec.company_id,
+                    rec.date,
                 )
             rec.amount_company_currency = amount_company_currency
 
@@ -526,10 +555,14 @@ class AccountPayment(models.Model):
         conciliacion de deuda de un asiento normal no lo muestra)
         """
         stored_payments = self.filtered("id")
+        # _get_valid_payment_account_types() does not depend on the filtered
+        # line, so we compute it once instead of on every line. Otherwise it
+        # triggers an N+1: account_balance_import overrides it to call
+        # company.get_unaffected_earnings_account(), which runs an uncached
+        # search on account.account once per evaluated line.
+        valid_payment_account_types = self._get_valid_payment_account_types()
         for rec in stored_payments:
-            payment_lines = rec.move_id.line_ids.filtered(
-                lambda x: x.account_type in self._get_valid_payment_account_types()
-            )
+            payment_lines = rec.move_id.line_ids.filtered(lambda x: x.account_type in valid_payment_account_types)
             debit_moves = payment_lines.mapped("matched_debit_ids.debit_move_id")
             credit_moves = payment_lines.mapped("matched_credit_ids.credit_move_id")
             debit_lines_sorted = debit_moves.filtered(lambda x: x.date_maturity != False).sorted(
@@ -645,12 +678,6 @@ class AccountPayment(models.Model):
         for rec in self:
             rec.to_pay_amount = rec.selected_debt + rec.unreconciled_amount
 
-    @api.onchange("to_pay_move_line_ids")
-    def _onchange_amount(self):
-        for rec in self.filtered(lambda r: r.company_id.use_payment_pro):
-            if rec.amount != abs(rec.to_pay_amount):
-                rec.amount = abs(rec.to_pay_amount)
-
     @api.onchange("to_pay_amount")
     def _inverse_to_pay_amount(self):
         for rec in self:
@@ -745,7 +772,15 @@ class AccountPayment(models.Model):
                 )
 
     def _reconcile_after_post(self):
-        for rec in self.filtered(lambda x: x.company_id.use_payment_pro and not x.is_internal_transfer):
+        to_reconcile = self.filtered(lambda x: x.company_id.use_payment_pro and not x.is_internal_transfer)
+        # El pago con tarjeta de crédito llega a 'paid' con el asiento en borrador (el core no lo
+        # postea) y _reconcile_after_post exige posteados. Posteamos ese asiento antes de conciliar.
+        to_reconcile.filtered(
+            lambda p: p.state == "paid" and p.outstanding_account_id.account_type == "liability_credit_card"
+        ).move_id.filtered(
+            lambda m: m.state == "draft" and m.company_currency_id.is_zero(sum(m.line_ids.mapped("balance")))
+        ).action_post()
+        for rec in to_reconcile:
             counterpart_aml = rec.mapped("move_id.line_ids").filtered(
                 lambda r: not r.reconciled and r.account_id.account_type in self._get_valid_payment_account_types()
             )

@@ -153,27 +153,36 @@ class AccountPayment(models.Model):
         return super()._select_bundle(bundles)
 
     def action_post(self):
-        if self.link_payment_ids and self.payment_method_code != "payment_bundle":
-            self.link_payment_ids.unlink()
+        for rec in self:
+            if rec.link_payment_ids and rec.payment_method_code != "payment_bundle":
+                rec.link_payment_ids.unlink()
 
-        if self.main_payment_id and not self.main_payment_id.name:
-            raise ValidationError(_("The main payment must have a name before a linked payment can be posted."))
+            if rec.main_payment_id and not rec.main_payment_id.name:
+                raise ValidationError(_("The main payment must have a name before a linked payment can be posted."))
 
         res = super(AccountPayment, self).action_post()
 
-        start_number = len(self.link_payment_ids.filtered(lambda x: x.name is not False))
-        for i, payment in enumerate(self.link_payment_ids, start=start_number):
-            if not payment.name:
-                payment.name = f"{self.name} ({i + 1})"
+        for rec in self:
+            start_number = len(rec.link_payment_ids.filtered(lambda x: x.name is not False))
+            for i, payment in enumerate(rec.link_payment_ids, start=start_number):
+                if not payment.name:
+                    payment.name = f"{rec.name} ({i + 1})"
 
-        draft_linked = self.link_payment_ids.filtered(lambda x: x.state == "draft")
+        draft_linked = self.filtered(lambda x: x.state != "draft").link_payment_ids.filtered(
+            lambda x: x.state == "draft"
+        )
         if draft_linked:
             draft_linked.action_post()
+
+        # Envío diferido del recibo del main: acá los vinculados ya imputaron, así el
+        # PDF sale con los comprobantes y no "A cuenta" (receiptbook lo saltea en el post).
+        self.filtered("is_main_payment")._send_receiptbook_mail()
 
         return res
 
     def action_draft(self):
-        res = super(AccountPayment, self + self.link_payment_ids).action_draft()
+        active_links = self.link_payment_ids.filtered(lambda p: p.state != "canceled")
+        res = super(AccountPayment, self + active_links).action_draft()
         if self.main_payment_id:
             return {
                 "type": "ir.actions.act_window",
@@ -324,7 +333,7 @@ class AccountPayment(models.Model):
             amount_payments = abs(amount_inbound + amount_outbound)
 
             rec.payment_difference = (
-                abs(rec.main_payment_id.selected_debt)
+                abs(rec.main_payment_id.to_pay_amount)
                 - amount_payments
                 - rec.main_payment_id.withholdings_amount
                 - rec.main_payment_id.write_off_amount
